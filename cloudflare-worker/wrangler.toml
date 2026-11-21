@@ -1,0 +1,13 @@
+name = "hub-router"
+main = "hub-router.js"
+compatibility_date = "2025-01-01"
+
+# Attach the Worker to your domain (domain must be on Cloudflare DNS):
+routes = [
+  { pattern = "hubpa.com/*", zone_name = "hubpa.com" },
+  { pattern = "www.hubpa.com/*", zone_name = "hubpa.com" }
+]
+
+[vars]
+ORIGINS = "https://SERVER1.koyeb.app,https://SERVER2.koyeb.app,https://SERVER3.koyeb.app,https://SERVER4.onrender.com"
+# ORIGIN_SECRET is a SECRET, do not put it here:  wrangler secret put ORIGIN_SECRET
