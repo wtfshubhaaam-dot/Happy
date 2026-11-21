@@ -1,0 +1,43 @@
+# Render Blueprint for ONE worker server (free plan). Duplicate the block for more servers, changing name / NODE_ID.
+# NODE_ID must be UNIQUE on every server (Koyeb n1/n2/n3 ..., Render n4). NODE_ROLE=worker here: ONLY ONE server in total may be 'gateway'.
+# Render sets PORT and RENDER_EXTERNAL_URL itself. Fill the "sync: false" values in the Render dashboard.
+services:
+  - type: web
+    name: filestorebot-n4
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz        # liveness only: a MongoDB hiccup must not restart every server
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: DB_NAME
+        value: filesharebot
+      # Optional extra MongoDB clusters (same values on EVERY server): see .env.example
+      - key: MONGO_URI_2
+        sync: false
+      - key: MONGO_URI_3
+        sync: false
+      - key: MONGO_MAX_POOL
+        value: "5"
+      - key: CLUSTER_SECRET
+        sync: false
+      - key: NODE_ID
+        value: n4
+      - key: NODE_ROLE
+        value: worker
+      - key: NODE_CAPACITY
+        value: "10"
+      # Optional hardening (add in the dashboard): PUBLIC_URL, ORIGIN_SECRET (same as in the Cloudflare Worker), DL_RATE_PER_10S
+
+      - key: NODE_MAX_TASKS
+        value: "10"
+      - key: NODE_HARD_TASKS
+        value: "10"

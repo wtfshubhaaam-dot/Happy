@@ -1,0 +1,27 @@
+# Automatic HTTPS (Let's Encrypt). DOMAIN, CLUSTER_ALLOW and TG_ALLOW come from .env (docker-compose passes them on).
+{$DOMAIN} {
+	# Multi-server: /internal/update is called only by the gateway servers. Set CLUSTER_ALLOW in .env to their public IPs
+	# (space separated, e.g. "203.0.113.10 198.51.100.7"). Default = everybody (the cluster secret still protects it).
+	@internal_denied {
+		path /internal/*
+		not remote_ip {$CLUSTER_ALLOW}
+	}
+	respond @internal_denied 403
+
+	# Telegram webhook (only on a gateway): set TG_ALLOW="149.154.160.0/20 91.108.4.0/22" to accept Telegram's servers only.
+	# Do NOT set it when this domain is behind Cloudflare's orange cloud (Caddy would then only see Cloudflare's addresses).
+	@tg_denied {
+		path /tg/*
+		not remote_ip {$TG_ALLOW}
+	}
+	respond @tg_denied 403
+
+	# flush_interval -1 = send bytes immediately -> video streaming / downloads start fast and never buffer in RAM
+	reverse_proxy bot:8080 {
+		flush_interval -1
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 60s
+		}
+	}
+}
