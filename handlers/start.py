@@ -1,0 +1,306 @@
+"""
+handlers/start.py
+The ONLY typed command: /start.
+  admin, no token  -> admin panel
+  user, no token   -> start image + caption + join buttons + "Try Again / Verify"
+  with token       -> force-sub check -> deliver files (or show the join screen)
+Also: the "✅ I've Joined" / "Verify" callback and the file delivery routine.
+"""
+import asyncio
+import html
+import logging
+import time
+
+from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as M
+from telegram.constants import ParseMode
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
+from telegram.ext import ContextTypes
+
+from database import db
+from database.db import settings as S
+from handlers import admin
+from utils.helpers import call, is_admin, notify_owner, render_caption, retry_seconds
+from utils import ads, cluster
+from utils.membership import get_missing
+import config
+
+log = logging.getLogger(__name__)
+USER_GONE = ("blocked", "deactivated", "can't initiate", "user is deleted")
+
+COOLDOWN_SECONDS = 5          # gap between two link opens per user (admins exempt)
+_last_open: dict = {}         # user_id -> monotonic time of the last accepted link open
+
+
+# ------------------------------------------------------------------ /start
+async def start_cmd(update, context: ContextTypes.DEFAULT_TYPE):
+    user, msg = update.effective_user, update.effective_message
+    banned = await db.touch_user(user.id)      # register + ban check in ONE database round trip
+    context.user_data.clear()  # drop any half-finished admin prompt
+
+    if banned and not is_admin(user.id):
+        await msg.reply_text("🚫 You are banned from using this bot.")
+        return
+
+    token = context.args[0] if context.args else ""
+    if not token:
+        if is_admin(user.id):
+            await admin.send_panel(update, context)
+        else:
+            await send_gate(context, user, msg.chat_id, token="")
+        return
+    await handle_token(context, user, msg.chat_id, token)
+
+
+async def handle_token(context, user, chat_id: int, token: str):
+    if is_admin(user.id):  # admins bypass force-subscribe
+        link, missing = await db.get_link(token), []
+    else:                  # link lookup and channel-membership check run in parallel (faster first response)
+        link, missing = await asyncio.gather(db.get_link(token), get_missing(context.bot, user.id))
+    if not link:
+        await call(context.bot.send_message, chat_id, "❌ This link is invalid or has been revoked.")
+        return
+    if missing:
+        await send_gate(context, user, chat_id, token, missing)
+        return
+    await request_access(context.bot, chat_id, link)
+
+
+# ------------------------------------------------------------------ join screen
+async def send_gate(context, user, chat_id: int, token: str = "", missing=None):
+    """Start image + caption + channel buttons + custom buttons + verify button."""
+    channels = []
+    if S.get("fsub_enabled"):
+        channels = missing if missing is not None else S.get("fsub_channels")
+    rows, row = [], []
+    for ch in channels:
+        row.append(B(f"📢 {ch['title'][:28]}", url=ch["link"]))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    for custom_row in S.get("custom_buttons"):
+        rows.append([B(t, url=u) for t, u in custom_row])
+    rows.append([B("✅ I've Joined" if token else "🔄 Try Again / Verify", callback_data=f"chk:{token}")])
+
+    caption = render_caption(S.get("start_caption"), user)
+    kb = M(rows)
+    image = S.get("start_image")
+    if image:
+        try:
+            await call(context.bot.send_photo, chat_id, image, caption=caption,
+                       reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+        except BadRequest as e:  # bad file_id / caption too long -> fall back to text
+            log.warning("Start image failed: %s", e)
+    await call(context.bot.send_message, chat_id, caption, reply_markup=kb,
+               parse_mode=ParseMode.HTML)
+
+
+async def check_callback(update, context):
+    """Handles 'chk:<token>' (✅ I've Joined) and 'chk:' (Try Again / Verify)."""
+    q, user = update.callback_query, update.callback_query.from_user
+    token = q.data.split(":", 1)[1]
+    link = None
+    if not is_admin(user.id):
+        banned, missing = await asyncio.gather(db.is_banned(user.id), get_missing(context.bot, user.id))
+        if banned:
+            await q.answer("🚫 You are banned from using this bot.", show_alert=True)
+            return
+        if missing:
+            names = ", ".join(c["title"] for c in missing)[:150]
+            await q.answer(f"❌ Please join first: {names}", show_alert=True)
+            return
+    await q.answer()
+    if token:
+        link_task = asyncio.ensure_future(db.get_link(token))      # fetch while the old message is being deleted
+    try:
+        await q.message.delete()
+    except TelegramError:
+        pass
+    if not token:
+        await call(context.bot.send_message, q.message.chat_id,
+                   f"✅ Verified! Now open a file link to receive your files.\n\n📊 Daily limit: {db.limit_value()} links per user per day (each link gives all its files).")
+        return
+    link = await link_task
+    if not link:
+        await call(context.bot.send_message, q.message.chat_id, "❌ This link is invalid or has been revoked.")
+        return
+    await request_access(context.bot, q.message.chat_id, link)
+
+
+# ------------------------------------------------------------------ delivery
+async def _copy_one(bot, chat_id, from_chat, mid, protect, caption, safe=False):
+    """copy_message with flood-wait retry; drops the caption override if Telegram rejects it.
+    safe=True: the original caption holds the hidden backup code, so on failure send NO caption instead."""
+    kw = dict(chat_id=chat_id, from_chat_id=from_chat, message_id=mid, protect_content=protect)
+    if caption is not None:
+        kw.update(caption=caption, parse_mode=ParseMode.HTML)
+    for _ in range(4):
+        try:
+            return await bot.copy_message(**kw)
+        except RetryAfter as e:
+            await asyncio.sleep(retry_seconds(e) + 1)
+        except BadRequest as e:
+            if "caption" in kw and "chat not found" not in str(e).lower() \
+                    and "message to copy not found" not in str(e).lower():
+                if safe and kw["caption"] == "":
+                    raise
+                if safe:
+                    kw["caption"] = ""
+                    kw.pop("parse_mode", None)
+                else:
+                    kw.pop("caption")
+                    kw.pop("parse_mode", None)
+                continue
+            raise
+    return await bot.copy_message(**kw)
+
+
+def _caption_override():
+    """None = keep original caption, "" = remove it, text = custom HTML caption."""
+    custom = S.get("custom_caption")
+    if custom:
+        return custom
+    return "" if S.get("remove_caption") else None
+
+
+async def _limit_reached(bot, chat_id: int):
+    await call(bot.send_message, chat_id,
+               f"🚫 <b>Daily limit reached</b>\n\nYou can open only <b>{db.limit_value()}</b> links per day. "
+               "Please come back tomorrow (resets at 12:00 AM IST).", parse_mode=ParseMode.HTML)
+
+
+async def request_access(bot, chat_id: int, link: dict):
+    """Entry point for a user who passed force-subscribe: cooldown -> daily limit -> Monetag ad gate -> files.
+    A FREE link (the image link of an Autoposter Image + Video post) skips cooldown, daily limit and ad gate."""
+    free = bool(link.get("free"))
+    if not is_admin(chat_id) and not free:
+        wait = COOLDOWN_SECONDS - (time.monotonic() - _last_open.get(chat_id, 0.0))
+        if wait > 0:
+            await call(bot.send_message, chat_id,
+                       f"⏳ Please wait <b>{int(wait) + 1}</b> second(s) before opening the next link.",
+                       parse_mode=ParseMode.HTML)
+            return
+        _last_open[chat_id] = time.monotonic()
+        if len(_last_open) > 20000:                              # keep memory bounded
+            _last_open.clear()
+        if S.get("ads_enabled") and await db.used_today(chat_id) >= db.limit_value():
+            await _limit_reached(bot, chat_id)                  # don't make them watch an ad for nothing
+            return
+    await cluster.connect_animation(bot, chat_id)               # multi-server mode: "Connecting... Connected: <server>"
+    if not free and await ads.gate(bot, chat_id, link):         # Mini App button sent; files follow after the ad
+        return
+    await deliver(bot, chat_id, link)
+
+
+async def deliver(bot, chat_id: int, link: dict):
+    """Daily-limit gate (10 LINKS per user per day, admins exempt). One link = 1 count, however many files it has."""
+    ids = [i for i in link["ids"] if i]          # slots not restored yet are None
+    if not ids:
+        await _unavailable(bot, chat_id)
+        return
+    if is_admin(chat_id) or link.get("free"):     # admins, and free-preview links: no daily count
+        await _deliver(bot, chat_id, {**link, "ids": ids})
+        return
+
+    limit = db.limit_value()
+    granted, used = await db.claim_quota(chat_id)      # 1 link = 1 count (atomic, one DB call)
+    if granted <= 0:
+        await _limit_reached(bot, chat_id)
+        return
+
+    delivered = await _deliver(bot, chat_id, {**link, "ids": ids})   # ALL files of the link
+    if delivered <= 0:
+        await db.refund_quota(chat_id, 1)              # nothing was received -> don't burn a count
+        used = max(0, used - 1)
+    _last_open[chat_id] = time.monotonic()             # cooldown starts after delivery finishes
+
+    text = f"📊 <b>Daily limit:</b> {used}/{limit} links used today · {max(0, limit - used)} left"
+    if cluster.ENABLED:
+        text += "\n" + cluster.server_line()
+    if used >= limit:
+        text += "\n\n🚫 Limit reached. Come back tomorrow (resets at 12:00 AM IST)."
+    await call(bot.send_message, chat_id, text, parse_mode=ParseMode.HTML)
+
+
+async def _deliver(bot, chat_id: int, link: dict) -> int:
+    """Send files into Telegram chats. Returns how many were delivered."""
+    channel = S.get("db_channel")
+    if not channel:                                   # this server's cache may be stale -> ask MongoDB once
+        try:
+            await db.settings.load()
+        except Exception:
+            log.warning("Settings reload failed", exc_info=True)
+        channel = S.get("db_channel")
+    if not channel:
+        log.error("db_channel is empty on this server (DB_NAME=%s). Set the Database Channel in the panel, "
+                  "and make sure every server uses the SAME MONGO_URI and DB_NAME.", config.DB_NAME)
+        await call(bot.send_message, chat_id, "⚠️ The bot is not set up yet. Please try again later.")
+        return 0
+    return await deliver_forward(bot, chat_id, link, channel)
+
+
+async def deliver_forward(bot, chat_id: int, link: dict, channel: dict) -> int:
+    protect, base_caption = S.get("protect"), _caption_override()
+    caps = await db.caption_overrides(link["ids"])   # original captions; the hidden backup code is never sent
+    sent, skipped, files = [], 0, 0
+
+    for mid in link["ids"]:
+        caption = base_caption if base_caption is not None else caps.get(mid)
+        try:
+            m = await _copy_one(bot, chat_id, channel["id"], mid, protect, caption,
+                                safe=base_caption is None and mid in caps)
+            sent.append(m.message_id)
+            files += 1
+        except Forbidden as e:
+            if any(w in str(e).lower() for w in USER_GONE):
+                return files  # the user blocked the bot - nothing more to do
+            await _config_problem(bot, channel, e)
+            await _unavailable(bot, chat_id)
+            return files
+        except BadRequest as e:
+            if "chat not found" in str(e).lower():
+                await _config_problem(bot, channel, e)
+                await _unavailable(bot, chat_id)
+                return files
+            skipped += 1  # message deleted from the DB channel -> skip it
+            log.info("Skipping message %s: %s", mid, e)
+        except TelegramError as e:
+            skipped += 1
+            log.warning("Delivery error: %s", e)
+        await asyncio.sleep(0.05)  # gentle pacing against flood limits
+
+    if not sent:
+        await _unavailable(bot, chat_id)
+        return 0
+
+    await db.inc_views(link["_id"])
+    minutes = S.get("autodelete")
+    if minutes:
+        try:
+            notice = await call(
+                bot.send_message, chat_id,
+                f"⏳ These files will be deleted in <b>{minutes} minute{'s' if minutes != 1 else ''}</b>. "
+                "Please save them before then.", parse_mode=ParseMode.HTML)
+            sent.append(notice.message_id)
+        except TelegramError:
+            pass
+        await db.schedule_delete(chat_id, sent, minutes)
+    if skipped:
+        await call(bot.send_message, chat_id, f"ℹ️ {skipped} file(s) are no longer available.")
+    return files
+
+
+async def _unavailable(bot, chat_id):
+    try:
+        await bot.send_message(chat_id, "⚠️ Files are temporarily unavailable. Please try again later.")
+    except TelegramError:
+        pass
+
+
+async def _config_problem(bot, channel, err):
+    await notify_owner(
+        bot, "dbch",
+        f"⚠️ Unable to read the Database Channel \"{channel.get('title')}\": {err}\n"
+        "Make sure the bot is an admin there, or set the channel again.")
