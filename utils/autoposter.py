@@ -1,0 +1,485 @@
+"""
+utils/autoposter.py
+Autoposter engine (no UI here - the panel lives in handlers/autoposter.py).
+
+  parse_slots / fmt_slots   "09:00 2" style timing input
+  item_from_ptb / item_from_pyro   one source message -> a small dict
+  group_posts               caption file = thumbnail, captionless files below it = the post's files
+  create_posts              copy everything into the Database Channel (with backup codes), make links + post records
+                            (channel post type "iv" -> create_iv_posts: image + video pairs, see below)
+  group_iv / create_iv_posts / _send_iv
+                            POST TYPE "Image + Video": image 1, video 1, image 2, video 2 ... Every (image + video) pair is ONE
+                            post with TWO links: the image link is a free preview (no ad gate, no daily-limit count), the video
+                            link goes through the ad gate. The post in the channel shows ONE fixed thumbnail (set per channel).
+  send_post                 publish one post (thumbnail + caption + "Get Files" button) to a channel / group
+  ensure_queue              shuffled queue: every post once per cycle in random order (loop = reshuffle each cycle,
+                            one pass = pause when every post is posted); new posts are mixed into the running cycle
+  next_slot                 next upcoming timing (for the Queue screen)
+  autopost_loop             background scheduler (all times in IST)
+"""
+import asyncio
+import datetime as dt
+import html
+import logging
+import re
+import time
+from zoneinfo import ZoneInfo
+
+from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as M
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
+
+from database import db
+from database.db import settings as S
+from utils.helpers import call, notify_owner
+from utils.links import share_link
+
+log = logging.getLogger(__name__)
+
+IST = ZoneInfo("Asia/Kolkata")
+MEDIA = ("document", "video", "audio", "photo", "animation", "voice", "video_note", "sticker")
+NO_CAPTION = ("video_note", "sticker")      # Telegram cannot attach a caption to these -> no backup code
+CAPTION_MAX = 1024
+MAX_PER_SLOT = 50
+SLOT_GRACE = 30 * 60        # a slot is still run up to 30 min late (bot was restarting); after that it is skipped
+COPY_DELAY = 0.15           # seconds between copies into the Database Channel (flood safety)
+POST_DELAY = 3              # seconds between two posts of the same slot
+
+_tasks: set = set()
+
+
+def spawn(coro):
+    """Run a coroutine in the background and keep a reference so it is not garbage-collected."""
+    t = asyncio.ensure_future(coro)
+    _tasks.add(t)
+    t.add_done_callback(_tasks.discard)
+    return t
+
+
+# ------------------------------------------------------------------ timings
+_SPLIT = re.compile(r"[\n,;]+")
+_SLOT = re.compile(r"^(\d{1,2})[:.](\d{2})(?:\s*(?:x|×|\*)?\s*(\d{1,3}))?$", re.I)
+
+
+def parse_slots(text: str) -> list:
+    """'09:00 2' / '14:30' / '21:00 x3', one per line or comma separated -> [{"t": "09:00", "n": 2}, ...]"""
+    out = []
+    for part in _SPLIT.split(text or ""):
+        part = part.strip()
+        if not part:
+            continue
+        m = _SLOT.match(part)
+        if not m:
+            raise ValueError(f"Cannot read: {part}")
+        h, mi, n = int(m.group(1)), int(m.group(2)), int(m.group(3) or 1)
+        if h > 23 or mi > 59:
+            raise ValueError(f"Invalid time: {part}")
+        if not 1 <= n <= MAX_PER_SLOT:
+            raise ValueError(f"Posts per time must be 1-{MAX_PER_SLOT}: {part}")
+        out.append({"t": f"{h:02d}:{mi:02d}", "n": n})
+    if not out:
+        raise ValueError("No time found")
+    return out
+
+
+def fmt_slots(slots: list) -> str:
+    return ", ".join(f"{s['t']} ×{s['n']}" for s in sorted(slots, key=lambda s: s["t"])) or "not set"
+
+
+# ------------------------------------------------------------------ source messages -> items
+def item_from_ptb(msg, kind: str, name: str) -> dict:
+    """A file the admin sent / forwarded to the bot."""
+    return {"chat": msg.chat_id, "mid": msg.message_id, "kind": kind, "name": name,
+            "cap": (msg.caption or ""), "cap_html": (msg.caption_html or ""),
+            "gid": str(msg.media_group_id) if getattr(msg, "media_group_id", None) else None}
+
+
+
+def group_posts(items: list):
+    """
+    A file WITH a caption starts a new post and is its thumbnail.
+    Every file WITHOUT a caption below it belongs to that post, until the next captioned file.
+    A captionless album below a captioned file = files of that post (all photos in the same link).
+    An album that itself has a caption = its own post.
+    Returns (posts, orphans): orphans = captionless files that came before the first caption.
+    """
+    albums = {}
+    for it in items:
+        if it.get("gid"):
+            albums.setdefault(it["gid"], []).append(it)
+    posts, cur, orphans, done = [], None, 0, set()
+    for it in items:
+        gid = it.get("gid")
+        # a captioned album = ONE post (all its files in one link, the captioned item is the thumbnail)
+        if gid and gid not in done and any(x["cap"].strip() for x in albums[gid]):
+            done.add(gid)
+            files = albums[gid]
+            thumb = next(x for x in files if x["cap"].strip())
+            cur = {"thumb": thumb, "files": list(files), "album": True}
+            posts.append(cur)
+        elif gid in done:
+            continue
+        elif it["cap"].strip():
+            cur = {"thumb": it, "files": []}
+            posts.append(cur)
+        elif cur is not None:          # captionless file / album -> files of the post above it
+            cur["files"].append(it)
+        else:
+            orphans += 1
+    return posts, orphans
+
+
+# ------------------------------------------------------------------ post caption / button (set from the admin panel)
+DEFAULT_BTN = "📥 Get Files"
+BTN_MAX = 40
+# Image + Video type: two buttons side by side, so the labels stay short
+DEFAULT_BTN_IMG = "🖼 Free Preview"
+DEFAULT_BTN_VID = "🎬 Watch Video"
+BTN_MAX_IV = 24
+IV_IMAGE = ("photo",)                          # the image of a pair
+IV_VIDEO = ("video", "document", "animation")  # the video of a pair (videos are often sent as files)
+
+
+def _plain_len(h: str) -> int:
+    return len(html.unescape(re.sub(r"<[^>]+>", "", h)))
+
+
+def render_caption(tpl: str, cap_html: str) -> str:
+    """ONE fixed caption for every post, exactly as the admin wrote it (no placeholder, the post's own
+    caption is NOT mixed in). Only if no fixed caption is set, the post's own caption is used."""
+    tpl = (tpl or "").replace("{caption}", "").strip()
+    if not tpl:
+        return cap_html
+    if _plain_len(tpl) <= CAPTION_MAX:
+        return tpl
+    return tpl[:CAPTION_MAX]
+
+
+# ------------------------------------------------------------------ storing into the Database Channel
+def _caption_with_code(it: dict, code: str) -> str:
+    tag = f"<code>{code}</code>"
+    orig, plain = it["cap_html"].strip(), it["cap"].strip()
+    if len(plain) + len(code) + 2 <= CAPTION_MAX:
+        return f"{orig}\n\n{tag}" if orig else tag
+    room = max(0, CAPTION_MAX - len(code) - 2)
+    return f"{html.escape(plain[:room])}\n\n{tag}"
+
+
+async def _store(bot, channel_id: int, it: dict, code: str, by: int) -> int:
+    """Copy one source message into the Database Channel under a backup code. Returns the new message id."""
+    caption = None if it["kind"] in NO_CAPTION else _caption_with_code(it, code)
+    kw = {"caption": caption, "parse_mode": ParseMode.HTML} if caption is not None else {}
+    copied = await call(bot.copy_message, channel_id, it["chat"], it["mid"], **kw)
+    await db.add_file(copied.message_id, it["kind"], it["name"], by,
+                      code=code if caption is not None else None, cap=it["cap_html"])
+    await asyncio.sleep(COPY_DELAY)
+    return copied.message_id
+
+
+async def create_posts(bot, items: list, cid: int, by: int, status_chat: int, status_msg: int):
+    """Group `items` into posts, store them in the Database Channel and register them for channel `cid`."""
+    if ((await db.ap_get_channel(cid)) or {}).get("ptype") == "iv":      # this channel makes Image + Video posts
+        return await create_iv_posts(bot, items, cid, by, status_chat, status_msg)
+    channel = S.get("db_channel")
+    kb = M([[B("📺 Open channel", callback_data=f"adm:apc:{cid}")]])
+    if not channel:
+        await bot.edit_message_text("⚠️ Database Channel is not set.", chat_id=status_chat,
+                                    message_id=status_msg, reply_markup=kb)
+        return
+
+    posts, orphans = group_posts(sorted(items, key=lambda i: i["mid"]))
+    total_files = sum(1 + len(p["files"]) for p in posts if p["files"])
+    seq = await db.ap_last_seq(cid)
+    made = skipped = copied_files = 0
+    new_tokens = []
+    error = ""
+    last_edit = 0.0
+
+    async def progress(final=False):
+        nonlocal last_edit
+        if not final and time.time() - last_edit < 3:
+            return
+        last_edit = time.time()
+        head = "⏳ <b>Creating posts…</b>" if not final else ("✅ <b>Posts created</b>" if not error else "⚠️ <b>Stopped</b>")
+        text = (f"{head}\n\n📝 Posts: {made}\n📁 Files stored: {copied_files}/{total_files}\n")
+        if skipped:
+            text += f"⏭ Skipped (caption but no files below): {skipped}\n"
+        if orphans:
+            text += f"⏭ Files before the first caption (ignored): {orphans}\n"
+        if error:
+            text += f"\n❌ <code>{html.escape(error)}</code>"
+        try:
+            await bot.edit_message_text(text, chat_id=status_chat, message_id=status_msg,
+                                        reply_markup=kb if final else None)
+        except TelegramError:
+            pass
+
+    for p in posts:
+        if not p["files"]:
+            skipped += 1
+            continue
+        token, thumb_token = db.new_token(), db.new_token()
+        ids = []
+        try:
+            for i, f in enumerate(p["files"]):
+                ids.append(await _store(bot, channel["id"], f, db.make_code(token, i), by))
+                copied_files += 1
+                await progress()
+            # the thumbnail is saved too, so the post can be rebuilt even if the bot / source channel is gone
+            await _store(bot, channel["id"], p["thumb"], db.make_code(thumb_token, 0), by)
+            copied_files += 1
+        except TelegramError as e:
+            error = str(e)
+            break
+        th = p["thumb"]
+        title = re.sub(r"\s+", " ", th["cap"]).strip()[:40] or ("Album" if p.get("album") else "Post")
+        await db.create_link(ids, by, title, token=token)
+        seq += 1
+        await db.ap_add_post(cid, token, thumb_token, seq, title, th["cap_html"], th["kind"], len(ids), by)
+        made += 1
+        new_tokens.append(token)
+        await progress()
+    await db.ap_enqueue_new(cid, new_tokens)      # mix the new posts into the running shuffled cycle
+    await progress(final=True)
+
+
+# ------------------------------------------------------------------ Image + Video posts
+def group_iv(items: list):
+    """image 1, video 1, image 2, video 2 ...  ->  [{"img": item, "vid": item}, ...], skipped.
+    Every photo starts a pair, the next video / video-file completes it. A photo that never gets a video, a video without a
+    photo before it, a second video in a row and every other file type are skipped (counted)."""
+    pairs, skipped, img = [], 0, None
+    for it in items:
+        kind = it["kind"]
+        if kind in IV_IMAGE:
+            if img is not None:
+                skipped += 1                      # the previous image never got its video
+            img = it
+        elif kind in IV_VIDEO:
+            if img is None:
+                skipped += 1                      # video without an image above it
+            else:
+                pairs.append({"img": img, "vid": it})
+                img = None
+        else:
+            skipped += 1
+    if img is not None:
+        skipped += 1
+    return pairs, skipped
+
+
+async def create_iv_posts(bot, items: list, cid: int, by: int, status_chat: int, status_msg: int):
+    """Store every (image, video) pair in the Database Channel (BOTH under a backup code, with their captions), make two links
+    (image = free preview, video = normal ad-gated link) and ONE post record per pair."""
+    channel = S.get("db_channel")
+    kb = M([[B("📺 Open channel", callback_data=f"adm:apc:{cid}")]])
+    if not channel:
+        await bot.edit_message_text("⚠️ Database Channel is not set.", chat_id=status_chat,
+                                    message_id=status_msg, reply_markup=kb)
+        return
+
+    pairs, skipped = group_iv(sorted(items, key=lambda i: i["mid"]))
+    seq = await db.ap_last_seq(cid)
+    made = stored = 0
+    new_tokens = []
+    error = ""
+    last_edit = 0.0
+
+    async def progress(final=False):
+        nonlocal last_edit
+        if not final and time.time() - last_edit < 3:
+            return
+        last_edit = time.time()
+        head = "⏳ <b>Creating posts…</b>" if not final else ("✅ <b>Posts created</b>" if not error else "⚠️ <b>Stopped</b>")
+        text = f"{head}\n\n🖼🎬 Image + Video posts: {made}\n📁 Files stored: {stored}/{len(pairs) * 2}\n"
+        if skipped:
+            text += f"⏭ Skipped (no matching image + video pair): {skipped}\n"
+        if error:
+            text += f"\n❌ <code>{html.escape(error)}</code>"
+        try:
+            await bot.edit_message_text(text, chat_id=status_chat, message_id=status_msg,
+                                        reply_markup=kb if final else None)
+        except TelegramError:
+            pass
+
+    for p in pairs:
+        img_token, vid_token = db.new_token(), db.new_token()
+        try:
+            img_mid = await _store(bot, channel["id"], p["img"], db.make_code(img_token, 0), by)
+            stored += 1
+            vid_mid = await _store(bot, channel["id"], p["vid"], db.make_code(vid_token, 0), by)
+            stored += 1
+        except TelegramError as e:
+            error = str(e)
+            break
+        cap_html = (p["img"]["cap_html"] or p["vid"]["cap_html"] or "").strip()
+        plain = (p["img"]["cap"] or p["vid"]["cap"] or "")
+        title = re.sub(r"\s+", " ", plain).strip()[:40] or "Image + Video"
+        await db.create_link([img_mid], by, title, token=img_token, free=True)     # free preview: no ads, no daily count
+        await db.create_link([vid_mid], by, title, token=vid_token)                # the normal link: force-sub, limit, ads
+        seq += 1
+        # post id = the VIDEO token (like a classic post's link token); the image link hangs on it as img_token
+        await db.ap_add_post(cid, vid_token, "", seq, title, cap_html, "photo", 2, by, ptype="iv", img_token=img_token)
+        made += 1
+        new_tokens.append(vid_token)
+        await progress()
+    await db.ap_enqueue_new(cid, new_tokens)
+    await progress(final=True)
+
+
+async def _send_iv(bot, chat_id: int, post: dict, mark: bool):
+    """Publish one Image + Video post: ONE fixed thumbnail + caption + two link buttons (image | video)."""
+    channel = S.get("db_channel")
+    if not channel:
+        return "Database Channel is not set"
+    ch = await db.ap_get_channel(chat_id) or {}
+    thumb = None
+    if ch.get("iv_thumb"):                                        # the channel's fixed thumbnail (looked up by backup code)
+        thumb = await db.thumb_msg_id(db.make_code(ch["iv_thumb"], 0))
+    if not thumb and post.get("img_token"):                       # none set (or it is gone): the post's own image
+        thumb = await db.thumb_msg_id(db.make_code(post["img_token"], 0))
+    if not thumb:
+        return "thumbnail not found in the Database Channel"
+    btn_i = (ch.get("btn_img") or "").strip() or DEFAULT_BTN_IMG
+    btn_v = (ch.get("btn_vid") or "").strip() or DEFAULT_BTN_VID
+    kb = M([[B(btn_i, url=share_link(bot.username, post["img_token"])),
+             B(btn_v, url=share_link(bot.username, post["_id"]))]])
+    try:
+        await call(bot.copy_message, chat_id, channel["id"], thumb,
+                   caption=render_caption(ch.get("cap_tpl"), post["cap"]),
+                   parse_mode=ParseMode.HTML, reply_markup=kb)
+    except TelegramError as e:
+        return str(e)
+    if mark:
+        await db.ap_mark_posted(post["_id"])
+    return None
+
+
+# ------------------------------------------------------------------ publishing
+async def send_post(bot, chat_id: int, post: dict, mark: bool = True):
+    """Publish one post to the channel / group. Returns None on success, else an error text.
+    mark=False: the caller (the queue) records the post as posted itself."""
+    if post.get("ptype") == "iv":                  # Image + Video post (a channel can hold both kinds)
+        return await _send_iv(bot, chat_id, post, mark)
+    channel = S.get("db_channel")
+    if not channel:
+        return "Database Channel is not set"
+    thumb = await db.thumb_msg_id(db.make_code(post["thumb_token"], 0))
+    if not thumb:
+        return "thumbnail not found in the Database Channel"
+    ch = await db.ap_get_channel(chat_id) or {}
+    btn = (ch.get("btn") or "").strip() or DEFAULT_BTN
+    kb = M([[B(btn, url=share_link(bot.username, post["_id"]))]])
+    try:
+        await call(bot.copy_message, chat_id, channel["id"], thumb,
+                   caption=render_caption(ch.get("cap_tpl"), post["cap"]),
+                   parse_mode=ParseMode.HTML, reply_markup=kb)
+    except TelegramError as e:
+        return str(e)
+    if mark:
+        await db.ap_mark_posted(post["_id"])
+    return None
+
+
+_locks: dict = {}
+
+
+def _lock(cid: int) -> asyncio.Lock:
+    return _locks.setdefault(cid, asyncio.Lock())
+
+
+async def ensure_queue(cid: int, ch: dict):
+    """Makes sure a cycle is running. Loop mode: a finished cycle is reshuffled with ALL posts.
+    One pass: only the posts that are not posted yet are queued."""
+    qs = ch.get("queue_state") or {}
+    queue = qs.get("queue") or []
+    if queue and int(qs.get("cursor", 0)) < len(queue):
+        return ch
+    loop = ch.get("loop", True)
+    if loop and int(qs.get("cycle", 0)) > 0:
+        return await db.ap_rebuild_cycle(cid)
+    ch = await db.ap_rebuild_cycle(cid, only_unused=True)       # first start: keeps what was already posted
+    if ch and loop and not (ch.get("queue_state") or {}).get("queue") and (await db.ap_counts(cid))[0]:
+        return await db.ap_rebuild_cycle(cid)                   # everything was posted already -> new shuffled cycle
+    return ch
+
+
+def next_slot(slots: list):
+    """(datetime, slot) of the next upcoming timing in IST, or None."""
+    now = dt.datetime.now(IST)
+    best = None
+    for sl in slots or []:
+        h, m = map(int, sl["t"].split(":"))
+        t = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if t <= now:
+            t += dt.timedelta(days=1)
+        if best is None or t < best[0]:
+            best = (t, sl)
+    return best
+
+
+async def run_slot(bot, ch: dict, n: int):
+    cid = ch["_id"]
+    async with _lock(cid):
+        ch = await db.ap_get_channel(cid)
+        if not ch or not ch.get("enabled", True):
+            return
+        loop = ch.get("loop", True)
+        ch = await ensure_queue(cid, ch)
+        if not ch:
+            return
+        sent = 0
+        while sent < n:
+            ch = await db.ap_get_channel(cid)
+            if not ch or not ch.get("enabled", True):
+                return
+            qs = ch.get("queue_state") or {}
+            queue, cursor = qs.get("queue") or [], int(qs.get("cursor", 0))
+            if cursor >= len(queue):
+                break                                   # cycle finished: the next time reshuffles (loop)
+            post = await db.ap_get_post(queue[cursor])
+            if not post or post.get("chan") != cid or post.get("posted"):
+                await db.ap_skip_cursor(cid)            # deleted, or already posted (e.g. with Post now)
+                continue
+            err = await send_post(bot, cid, post, mark=False)
+            if err:
+                await notify_owner(bot, f"ap_err_{cid}",
+                                   f"⚠️ Autoposter: cannot post in <b>{html.escape(ch['title'])}</b>:\n"
+                                   f"<code>{html.escape(err)}</code>", every=1800)
+                if err.startswith("thumbnail not found"):
+                    await db.ap_skip_cursor(cid)        # this post can never be sent -> do not block the queue
+                    continue
+                break
+            await db.ap_advance(cid, post["_id"])
+            sent += 1
+            await asyncio.sleep(POST_DELAY)
+
+        ch = await db.ap_get_channel(cid) or {}
+        qs = ch.get("queue_state") or {}
+        queue, cursor = qs.get("queue") or [], int(qs.get("cursor", 0))
+        finished = cursor >= len(queue)
+        await db.ap_finalize(cid, sent, finished and bool(queue))
+        if finished and not loop and (await db.ap_counts(cid))[0]:
+            await db.ap_set(cid, enabled=False)
+            await notify_owner(bot, f"ap_done_{cid}",
+                               f"⏸ Autoposter: every post of <b>{html.escape(ch.get('title', ''))}</b> is posted "
+                               "(one pass). Create more posts and turn it ON, or reshuffle to start over.", every=60)
+
+
+async def autopost_loop(bot):
+    await asyncio.sleep(10)
+    while True:
+        try:
+            now = dt.datetime.now(IST)
+            today = now.strftime("%Y-%m-%d")
+            for ch in await db.ap_channels_col.find({"enabled": True}).to_list(500):
+                for slot in ch.get("slots", []):
+                    h, m = map(int, slot["t"].split(":"))
+                    late = (now - now.replace(hour=h, minute=m, second=0, microsecond=0)).total_seconds()
+                    if 0 <= late <= SLOT_GRACE and await db.ap_claim_slot(ch["_id"], f"{today} {slot['t']}"):
+                        spawn(run_slot(bot, ch, int(slot.get("n", 1))))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Autoposter loop error")
+        await asyncio.sleep(20)
